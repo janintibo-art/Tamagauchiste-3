@@ -1,0 +1,142 @@
+name: Construire l'APK Tamagauchiste
+
+# Se dÃ©clenche Ã  chaque push, et peut Ãªtre lancÃ© Ã  la main depuis l'onglet Actions.
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: RÃ©cupÃ©rer le dÃ©pÃ´t
+        uses: actions/checkout@v4
+
+      - name: Installer le JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Installer le SDK Android
+        uses: android-actions/setup-android@v3
+
+      - name: Accepter les licences et installer les paquets SDK
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Recoller, vÃ©rifier et dÃ©compresser le ZIP
+        id: locate
+        run: |
+          shopt -s nullglob globstar
+
+          echo "== Fichiers .zip et parties prÃ©sents Ã  la racine =="
+          ls -la *.zip *.zip.* 2>/dev/null || echo "(aucun)"
+
+          # 1) Recoller les ZIP dÃ©coupÃ©s (<nom>.zip.00, .01, ...) avec vÃ©rifications.
+          declare -A bases
+          for p in *.zip.[0-9][0-9] **/*.zip.[0-9][0-9]; do
+            bases["${p%.[0-9][0-9]}"]=1
+          done
+          for full in "${!bases[@]}"; do
+            echo "== Parties trouvÃ©es pour $(basename "$full") =="
+            ls -la "${full}".[0-9][0-9]
+            mapfile -t parts < <(ls -1 "${full}".[0-9][0-9] | sort)
+            # VÃ©rifier que la numÃ©rotation commence Ã  .00 et est contiguÃ«.
+            i=0
+            for part in "${parts[@]}"; do
+              expected="$(printf "%s.%02d" "$full" "$i")"
+              if [ "$part" != "$expected" ]; then
+                echo "::error::Parties incohÃ©rentes : il manque $(basename "$expected"), ou les parties viennent de versions diffÃ©rentes. Supprime TOUTES les parties dans le dÃ©pÃ´t, puis re-tÃ©lÃ©verse les 4 parties du dernier message ENSEMBLE (sÃ©lection multiple, un seul upload)."
+                exit 1
+              fi
+              i=$((i+1))
+            done
+            echo "Recollage de $(basename "$full") depuis $i partie(s)..."
+            cat "${parts[@]}" > "$full"
+            echo "VÃ©rification de l'intÃ©gritÃ© de $(basename "$full")..."
+            if ! unzip -t -q "$full"; then
+              echo "::error::ZIP recollÃ© corrompu ($(basename "$full")) : les parties ne viennent pas toutes de la mÃªme version, ou l'une a mal Ã©tÃ© tÃ©lÃ©versÃ©e. Supprime TOUTES les parties dans le dÃ©pÃ´t, puis re-tÃ©lÃ©verse les 4 parties du dernier message ENSEMBLE (sÃ©lection multiple, un seul upload)."
+              exit 1
+            fi
+            echo "OK : $(basename "$full") est intÃ¨gre."
+          done
+
+          # 2) DÃ©compresser tout .zip prÃ©sent (recollÃ© ou non).
+          for z in *.zip **/*.zip; do
+            echo "DÃ©compression de : $z"
+            if ! unzip -o -q "$z" -d "_src_$(basename "$z" .zip)"; then
+              echo "::error::Ã‰chec de dÃ©compression de $z (archive corrompue)."
+              exit 1
+            fi
+          done
+
+          # 3) Trouver le projet Gradle (prioritÃ© au projet fraÃ®chement dÃ©compressÃ©).
+          SETTINGS="$(find . -path '*_src_*/settings.gradle' | grep -v '/build/' | head -n1 || true)"
+          [ -z "$SETTINGS" ] && SETTINGS="$(find . -name settings.gradle | grep -v '/build/' | head -n1 || true)"
+          [ -z "$SETTINGS" ] && SETTINGS="$(find . -name settings.gradle.kts | grep -v '/build/' | head -n1 || true)"
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::Aucun settings.gradle trouvÃ©. As-tu bien tÃ©lÃ©versÃ© le ZIP du projet (ou ses 4 parties) ?"
+            exit 1
+          fi
+          PROJDIR="$(cd "$(dirname "$SETTINGS")" && pwd)"
+          echo "Projet dÃ©tectÃ© : $PROJDIR"
+          echo "projdir=$PROJDIR" >> "$GITHUB_OUTPUT"
+
+      - name: RÃ©cupÃ©rer model-viewer (APK autonome)
+        working-directory: ${{ steps.locate.outputs.projdir }}
+        run: |
+          if [ -f scripts/fetch-deps.sh ]; then
+            bash scripts/fetch-deps.sh
+          else
+            echo "Pas de scripts/fetch-deps.sh : le CDN servira model-viewer."
+          fi
+
+      - name: S'assurer du wrapper Gradle (8.7)
+        working-directory: ${{ steps.locate.outputs.projdir }}
+        run: |
+          chmod +x gradlew || true
+          if [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
+            echo "gradle-wrapper.jar absent â†’ rÃ©gÃ©nÃ©ration avec le Gradle prÃ©installÃ© du runner."
+            if ! command -v gradle >/dev/null 2>&1; then
+              echo "::error::Gradle introuvable sur le runner et wrapper absent."
+              exit 1
+            fi
+            gradle wrapper --gradle-version 8.7 --distribution-type bin
+            chmod +x gradlew
+          fi
+
+      - name: Compiler l'APK (debug)
+        working-directory: ${{ steps.locate.outputs.projdir }}
+        run: ./gradlew :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Localiser l'APK produit
+        id: apk
+        working-directory: ${{ steps.locate.outputs.projdir }}
+        run: |
+          APK="$(find app/build/outputs/apk/debug -name '*.apk' | head -n1 || true)"
+          if [ -z "$APK" ]; then
+            echo "::error::APK introuvable aprÃ¨s le build."
+            exit 1
+          fi
+          echo "APK : $APK"
+          echo "path=${{ steps.locate.outputs.projdir }}/$APK" >> "$GITHUB_OUTPUT"
+
+      - name: Publier l'APK en artÃ©fact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Tamagauchiste-debug-apk
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
+
+      - name: Joindre l'APK Ã  la release (sur un tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.apk.outputs.path }}
